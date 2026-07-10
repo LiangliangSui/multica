@@ -1321,64 +1321,17 @@ func parseRuntimeConnectedAppsForClaim(raw []byte, taskID pgtype.UUID) []runtime
 	return apps
 }
 
-// ClaimTaskByRuntime atomically claims the next queued task for a runtime.
-// The response includes the agent's name and skills, fetched fresh from the DB.
-func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
-	runtimeID := chi.URLParam(r, "runtimeId")
-	start := time.Now()
-
-	var (
-		outcome                  = "unauth"
-		authMs, claimMs, buildMs int64
-		payloadBytes             int
-		agentSkillCount          int
-		builtinSkillCount        int
-		skillPayloadBytes        int
-		buildStart               time.Time
-	)
-	defer func() {
-		// Emit at function exit so error / unauth paths also carry timing.
-		// build_ms is computed from buildStart only when we entered the
-		// response-build phase (otherwise stays 0).
-		if !buildStart.IsZero() {
-			buildMs = time.Since(buildStart).Milliseconds()
-		}
-		logClaimEndpointSlow(runtimeID, outcome, start, authMs, claimMs, buildMs, payloadBytes, agentSkillCount, builtinSkillCount, skillPayloadBytes)
-	}()
-
-	// Verify the caller owns this runtime's workspace. The runtime's
-	// workspace_id is the authoritative value a claimed task must match
-	// below — a task whose resolved workspace doesn't equal this runtime's
-	// workspace is rejected even if it was enqueued against this
-	// runtime_id (defense-in-depth against upstream routing bugs).
-	runtime, ok := h.requireDaemonRuntimeAccess(w, r, runtimeID)
-	if !ok {
-		return
-	}
-	runtimeWorkspaceID := uuidToString(runtime.WorkspaceID)
-	authMs = time.Since(start).Milliseconds()
-
-	claimStart := time.Now()
-	task, err := h.TaskService.ClaimTaskForRuntime(r.Context(), parseUUID(runtimeID))
-	claimMs = time.Since(claimStart).Milliseconds()
-	if err != nil {
-		outcome = "error_claim"
-		writeError(w, http.StatusInternalServerError, "failed to claim task: "+err.Error())
-		return
-	}
-
-	if task == nil {
-		slog.Debug("no task to claim", "runtime_id", runtimeID)
-		payloadBytes, _ = writeMeasuredJSON(w, http.StatusOK, map[string]any{"task": nil})
-		outcome = "no_task"
-		return
-	}
-
-	outcome = "claimed"
-	buildStart = time.Now()
-
+// buildClaimedTaskResponse assembles the full daemon claim payload for a
+// single already-claimed task: agent config + skills, owner/initiator, repos,
+// squad-leader briefing, trigger-comment context, prior-session resume hints,
+// chat/quick-create context, and the workspace-isolation guard. It is shared
+// by the per-runtime handler (ClaimTaskByRuntime) and the machine-level batch
+// handler (ClaimTasksByRuntime, MUL-4257) so both return byte-identical task
+// payloads. ok is false when the workspace-isolation check fails; the caller
+// has already had the task cancelled here and must skip/omit it.
+func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQueue, runtime db.AgentRuntime, runtimeID, runtimeWorkspaceID string) (resp AgentTaskResponse, agentSkillCount, builtinSkillCount int, ok bool) {
 	// Build response with fresh agent data (name + skills + custom_env + custom_args).
-	resp := taskToResponse(*task, runtimeWorkspaceID)
+	resp = taskToResponse(*task, runtimeWorkspaceID)
 	composioMCPEnabled := h.composioMCPAppsEnabled(r.Context())
 	if composioMCPEnabled {
 		resp.ConnectedApps = parseRuntimeConnectedAppsForClaim(task.RuntimeConnectedApps, task.ID)
@@ -1989,7 +1942,6 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	// fail AND cancel the just-dispatched task so the queue / agent status
 	// don't sit stuck until the stale-task sweeper fires minutes later.
 	if resp.WorkspaceID == "" || resp.WorkspaceID != runtimeWorkspaceID {
-		outcome = "error_workspace"
 		slog.Error("task claim: workspace isolation check failed, cancelling task",
 			"task_id", uuidToString(task.ID),
 			"runtime_id", runtimeID,
@@ -2004,8 +1956,7 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 			slog.Error("task claim: cancel after workspace check failed",
 				"task_id", uuidToString(task.ID), "error", cerr)
 		}
-		writeError(w, http.StatusInternalServerError, "task workspace isolation check failed")
-		return
+		return resp, agentSkillCount, builtinSkillCount, false
 	}
 
 	// Workspace-level Context (workspace.context DB column) — the per-workspace
@@ -2026,6 +1977,211 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
+	return resp, agentSkillCount, builtinSkillCount, true
+}
+
+// claimBatchMaxTasksCap bounds how many tasks a single machine-level batch
+// claim may return, so one request can neither build an unbounded payload nor
+// hold the DB for an unbounded number of per-agent claim transactions. The
+// daemon never asks for more than its free execution-slot count anyway.
+const claimBatchMaxTasksCap = 32
+
+// ClaimTasksByRuntime is the machine-level (MUL-4257) batch claim endpoint. A
+// daemon posts every runtime_id it hosts plus its free execution-slot count and
+// receives up to max_tasks already-claimed tasks in ONE round trip — each
+// carrying its runtime_id so the daemon routes it to the matching runtime
+// locally. This collapses the per-runtime idle-poll fan-out (one HTTP request
+// plus one promote/reclaim/list cycle per runtime) into a single request backed
+// by = ANY merged queries.
+//
+// Unknown or unauthorized runtime_ids are skipped silently (a daemon may send a
+// runtime that was just deleted server-side; it self-heals via the heartbeat
+// path) rather than failing the whole batch. Each returned task carries a
+// freshly minted task-scoped token exactly like the per-runtime endpoint.
+func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	var req struct {
+		RuntimeIDs []string `json:"runtime_ids"`
+		MaxTasks   int      `json:"max_tasks"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	maxTasks := req.MaxTasks
+	if maxTasks <= 0 {
+		maxTasks = 1
+	}
+	if maxTasks > claimBatchMaxTasksCap {
+		maxTasks = claimBatchMaxTasksCap
+	}
+
+	// Resolve + authorize each runtime. Skip (don't fail) unknown/unauthorized
+	// ids so a single stale runtime can't sink the whole batch.
+	runtimeByID := make(map[string]db.AgentRuntime, len(req.RuntimeIDs))
+	authorized := make([]pgtype.UUID, 0, len(req.RuntimeIDs))
+	for _, rid := range req.RuntimeIDs {
+		if _, seen := runtimeByID[rid]; seen {
+			continue
+		}
+		ruid := parseUUID(rid)
+		if !ruid.Valid {
+			continue
+		}
+		rt, err := h.Queries.GetAgentRuntime(r.Context(), ruid)
+		if err != nil {
+			if !isNotFound(err) {
+				slog.Warn("batch claim: load runtime failed", "runtime_id", rid, "error", err)
+			}
+			continue
+		}
+		if !h.verifyDaemonWorkspaceAccess(r, uuidToString(rt.WorkspaceID)) {
+			continue
+		}
+		runtimeByID[rid] = rt
+		authorized = append(authorized, ruid)
+	}
+
+	if len(authorized) == 0 {
+		writeMeasuredJSON(w, http.StatusOK, map[string]any{"tasks": []AgentTaskResponse{}})
+		return
+	}
+
+	claimed, err := h.TaskService.ClaimTasksForRuntimes(r.Context(), authorized, maxTasks)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to claim tasks: "+err.Error())
+		return
+	}
+
+	out := make([]AgentTaskResponse, 0, len(claimed))
+	for i := range claimed {
+		task := claimed[i]
+		rt, ok := runtimeByID[uuidToString(task.RuntimeID)]
+		if !ok {
+			// Service guards claims to the authorized set; a miss here would be
+			// a stray cross-daemon claim. Leave it for the owning daemon's
+			// reclaim path rather than shipping it to the wrong machine.
+			continue
+		}
+		rtWorkspaceID := uuidToString(rt.WorkspaceID)
+		resp, _, _, ok := h.buildClaimedTaskResponse(r, &task, rt, uuidToString(task.RuntimeID), rtWorkspaceID)
+		if !ok {
+			// Workspace isolation failed; buildClaimedTaskResponse already
+			// cancelled the task. Skip it.
+			continue
+		}
+		if !rt.OwnerID.Valid {
+			slog.Error("batch claim: runtime owner missing; cancelling task to avoid unscoped agent credentials",
+				"task_id", uuidToString(task.ID), "runtime_id", uuidToString(task.RuntimeID))
+			if _, cerr := h.TaskService.CancelTask(r.Context(), task.ID); cerr != nil {
+				slog.Error("batch claim: cancel after missing runtime owner failed",
+					"task_id", uuidToString(task.ID), "error", cerr)
+			}
+			continue
+		}
+		tokenStr, terr := h.generateAndPersistTaskToken(r.Context(), task, resp.WorkspaceID, rt.OwnerID)
+		if terr != nil {
+			slog.Error("batch claim: mint task token failed; leaving task for reclaim",
+				"task_id", uuidToString(task.ID), "error", terr)
+			continue
+		}
+		resp.AuthToken = tokenStr
+		out = append(out, resp)
+	}
+
+	if len(out) > 0 {
+		slog.Info("tasks claimed by runtime batch",
+			"runtimes", len(authorized), "requested_max", maxTasks, "claimed", len(out),
+			"total_ms", time.Since(start).Milliseconds())
+	}
+	writeMeasuredJSON(w, http.StatusOK, map[string]any{"tasks": out})
+}
+
+// generateAndPersistTaskToken mints a task-scoped `mat_` token bound to
+// (agent, task, workspace, owner) and persists it, returning the plaintext
+// token. Shared by the batch claim path; see the token block in
+// ClaimTaskByRuntime for the security rationale.
+func (h *Handler) generateAndPersistTaskToken(ctx context.Context, task db.AgentTaskQueue, workspaceID string, ownerID pgtype.UUID) (string, error) {
+	tokenStr, err := auth.GenerateAgentTaskToken()
+	if err != nil {
+		return "", err
+	}
+	if _, err := h.Queries.CreateTaskToken(ctx, db.CreateTaskTokenParams{
+		TokenHash:   auth.HashToken(tokenStr),
+		TaskID:      task.ID,
+		AgentID:     task.AgentID,
+		WorkspaceID: parseUUID(workspaceID),
+		UserID:      ownerID,
+		ExpiresAt:   pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
+	}); err != nil {
+		return "", err
+	}
+	return tokenStr, nil
+}
+
+// ClaimTaskByRuntime atomically claims the next queued task for a runtime.
+// The response includes the agent's name and skills, fetched fresh from the DB.
+func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
+	runtimeID := chi.URLParam(r, "runtimeId")
+	start := time.Now()
+
+	var (
+		outcome                  = "unauth"
+		authMs, claimMs, buildMs int64
+		payloadBytes             int
+		agentSkillCount          int
+		builtinSkillCount        int
+		skillPayloadBytes        int
+		buildStart               time.Time
+	)
+	defer func() {
+		// Emit at function exit so error / unauth paths also carry timing.
+		// build_ms is computed from buildStart only when we entered the
+		// response-build phase (otherwise stays 0).
+		if !buildStart.IsZero() {
+			buildMs = time.Since(buildStart).Milliseconds()
+		}
+		logClaimEndpointSlow(runtimeID, outcome, start, authMs, claimMs, buildMs, payloadBytes, agentSkillCount, builtinSkillCount, skillPayloadBytes)
+	}()
+
+	// Verify the caller owns this runtime's workspace. The runtime's
+	// workspace_id is the authoritative value a claimed task must match
+	// below — a task whose resolved workspace doesn't equal this runtime's
+	// workspace is rejected even if it was enqueued against this
+	// runtime_id (defense-in-depth against upstream routing bugs).
+	runtime, ok := h.requireDaemonRuntimeAccess(w, r, runtimeID)
+	if !ok {
+		return
+	}
+	runtimeWorkspaceID := uuidToString(runtime.WorkspaceID)
+	authMs = time.Since(start).Milliseconds()
+
+	claimStart := time.Now()
+	task, err := h.TaskService.ClaimTaskForRuntime(r.Context(), parseUUID(runtimeID))
+	claimMs = time.Since(claimStart).Milliseconds()
+	if err != nil {
+		outcome = "error_claim"
+		writeError(w, http.StatusInternalServerError, "failed to claim task: "+err.Error())
+		return
+	}
+
+	if task == nil {
+		slog.Debug("no task to claim", "runtime_id", runtimeID)
+		payloadBytes, _ = writeMeasuredJSON(w, http.StatusOK, map[string]any{"task": nil})
+		outcome = "no_task"
+		return
+	}
+
+	outcome = "claimed"
+	buildStart = time.Now()
+
+	resp, agentSkillCount, builtinSkillCount, ok := h.buildClaimedTaskResponse(r, task, runtime, runtimeID, runtimeWorkspaceID)
+	if !ok {
+		outcome = "error_workspace"
+		writeError(w, http.StatusInternalServerError, "task workspace isolation check failed")
+		return
+	}
 	// Mint a task-scoped `mat_` token bound to (agent, task, workspace,
 	// owner). The daemon will inject this as MULTICA_TOKEN into the agent
 	// process instead of its own credential, so any API call the agent
